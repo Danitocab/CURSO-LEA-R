@@ -1,0 +1,522 @@
+# ==============================================================================
+# ANÁLISIS DE POBREZA MONETARIA EN COLOMBIA USANDO R
+# ==============================================================================
+
+# ==============================================================================
+# 1. CONFIGURACIÓN INICIAL Y CARGA DE LIBRERÍAS
+# ==============================================================================
+
+# Instalación de paquetes necesarios (ejecutar solo una vez)
+# install.packages(c("tidyverse", "data.table"))
+
+# Carga de librerías
+library(tidyverse)
+library(data.table)
+
+# Configuración de opciones
+options(scipen = 999)
+options(digits = 4)
+
+# ==============================================================================
+# 2. CARGA DE DATOS
+# ==============================================================================
+
+# Definir ruta de datos (ajustar según tu estructura)
+ruta_datos <- "input-poverty/"
+
+# Cargar datos del módulo Personas
+per <- fread(paste0(ruta_datos, "geih-personas.csv"))
+per <- as_tibble(per)
+
+# ==============================================================================
+# 3. EXPLORAR VARIABLES
+# ==============================================================================
+
+# Estructura de los datos: info()
+glimpse(per)
+
+# Primeras diez observaciones
+head(per, 10)
+
+# ==============================================================================
+# 4. RESUMEN DESCRIPTIVO
+# ==============================================================================
+
+# Promedio con mean() - Esto no va a funcionar directamente con todas las columnas
+# Solo variables numéricas
+per %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), ~mean(., na.rm = TRUE)))
+
+# Desviación estándar (método sd)
+per %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), ~sd(., na.rm = TRUE)))
+
+# Conteo sobre el "dominio": value_counts()
+per %>%
+  count(dominio) %>%
+  arrange(desc(n))
+
+# Proporción añadiendo "normalize"
+per %>%
+  count(dominio) %>%
+  mutate(proporcion = n / sum(n))
+
+# Proporción para "dominio" y "posicion2"
+per %>%
+  count(dominio, posicion2) %>%
+  mutate(proporcion = n / sum(n))
+
+# Tabla cruzada - equivalente a pd.crosstab()
+per %>%
+  count(dominio, posicion2) %>%
+  mutate(proporcion = n / sum(n) * 100) %>%
+  pivot_wider(
+    names_from = posicion2, 
+    values_from = c(n, proporcion), 
+    values_fill = 0
+  )
+
+# Resumen descriptivo general
+summary(per)
+
+# Resumen descriptivo sobre las variables de interés: edad, anios_edu, firm_exp, ingtot
+per %>%
+  select(edad, anios_edu, firm_exp, ingtot) %>%
+  summary()
+
+# ==============================================================================
+# 5. RESUMEN DESCRIPTIVO DIFERENCIADO
+# ==============================================================================
+
+# Ingreso medio según ciudad
+per %>%
+  group_by(dominio) %>%
+  summarise(ingreso_medio = mean(ingtot, na.rm = TRUE) / 1000) %>%
+  arrange(desc(ingreso_medio))
+
+# Utilizar dos variables categóricas: dominio y posicion2
+per %>%
+  group_by(dominio, posicion2) %>%
+  summarise(ingreso_medio = mean(ingtot, na.rm = TRUE), .groups = "drop")
+
+# Utilizar funciones específicas
+per %>%
+  group_by(dominio, posicion2) %>%
+  summarise(
+    media = mean(ingtot, na.rm = TRUE),
+    desv_std = sd(ingtot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Definir la función p10 (quantile(0.1))
+p10 <- function(x) quantile(x, 0.1, na.rm = TRUE)
+
+# Aplicar la función sobre el resumen descriptivo
+per %>%
+  group_by(dominio, posicion2) %>%
+  summarise(
+    media = mean(ingtot, na.rm = TRUE),
+    desv_std = sd(ingtot, na.rm = TRUE),
+    p10 = p10(ingtot),
+    .groups = "drop"
+  )
+
+# Otra forma más directa es usar funciones anónimas
+per %>%
+  group_by(dominio, posicion2) %>%
+  summarise(
+    media = mean(ingtot, na.rm = TRUE),
+    desv_std = sd(ingtot, na.rm = TRUE),
+    p10 = quantile(ingtot, 0.1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ==============================================================================
+# 6. TASA DE INCIDENCIA: POBREZA MONETARIA Y POBREZA MONETARIA EXTREMA
+# ==============================================================================
+
+# En esta sección vamos a calcular las tasas de incidencia de pobreza monetaria 
+# (PM) y pobreza monetaria extrema (PME) para el año 2023, enfocados en las tres 
+# principales ciudades del país y sus áreas metropolitanas: Cali, Medellín y Bogotá.
+#
+# El ejercicio consta de tres pasos:
+# - Paso 1: Cálculo del ingreso per cápita por unidad de gasto
+# - Paso 2: Comparación del ingreso per cápita con las líneas de pobreza
+# - Paso 3: Estimación de las tasas de incidencia (tanto simples como ponderadas)
+
+# ------------------------------------------------------------------------------
+# PASO 1: INGRESO PER CÁPITA POR UNIDAD DE GASTO
+# ------------------------------------------------------------------------------
+
+# La unidad de gasto se define como el conjunto de personas que comparten la 
+# misma vivienda y realizan arreglos en común para satisfacer necesidades básicas,
+# como alimentación y vivienda (DANE, 2023). Es importante destacar que una unidad
+# de gasto no siempre coincide con un hogar, ya que puede incluir a personas de
+# distintos hogares que comparten gastos esenciales.
+#
+# Para calcular el ingreso per cápita por unidad de gasto, es necesario importar
+# el módulo Hogares, que contiene la información sobre los hogares y sus 
+# respectivas unidades de gasto.
+
+# Cargar módulo de hogar
+hogar <- fread(paste0(ruta_datos, "geih-hogares.csv"))
+hogar <- as_tibble(hogar)
+
+# Examinar los datos
+head(hogar, 10)
+
+# Para continuar con el análisis, es necesario combinar los dos conjuntos de 
+# datos disponibles: Personas (per) y Hogares (hogar). 
+
+# Examinar variables llave
+per %>% select(directorio, secuencia_p, orden) %>% head()
+
+# Creamos la variable llave individual en "per"
+per <- per %>%
+  mutate(
+    id = directorio * 10000 + secuencia_p * 100 + orden,
+    id_hogar = directorio * 10000 + secuencia_p * 100
+  )
+
+# Examinamos los códigos
+per %>% select(directorio, secuencia_p, orden, id, id_hogar) %>% head()
+
+# Creamos la variable llave en "hogar"
+hogar <- hogar %>%
+  mutate(id_hogar = directorio * 10000 + secuencia_p * 100)
+
+hogar %>% select(directorio, secuencia_p, id_hogar) %>% head()
+
+# Utilizamos la variable id_hogar como variable llave para realizar la unión 
+# (left join) de los conjuntos de datos
+
+# Left join:
+per_hogar <- per %>%
+  left_join(hogar, by = "id_hogar", suffix = c("", "_hogar"))
+
+# Examinar la nueva estructura
+glimpse(per_hogar)
+
+# Examinar las nuevas observaciones
+head(per_hogar, 10)
+
+# Conteo de los miembros de la unidad de gasto
+per_hogar %>%
+  count(ug)
+
+# Calculamos el ingreso total por unidad de gasto
+# Filtramos ug == 1
+per_hogar_ug <- per_hogar %>%
+  filter(ug == 1)
+
+# Examinar las variables
+per_hogar_ug %>% 
+  select(id, id_hogar, ingtot) %>% 
+  head(10)
+
+# Individuos totales en cada unidad de gasto usando group_by() con count/n()
+n_hogar <- per_hogar_ug %>%
+  count(id_hogar, name = "n_individuos")
+
+print(n_hogar)
+
+# Ingreso totales por hogar usando group_by() con sum()
+ingreso_hogar <- per_hogar_ug %>%
+  group_by(id_hogar) %>%
+  summarise(ingreso_total = sum(ingtot, na.rm = TRUE))
+
+print(ingreso_hogar)
+
+# Creación del ingreso per cápita
+ingreso_pc <- per_hogar_ug %>%
+  group_by(id_hogar) %>%
+  summarise(
+    ingreso_total = sum(ingtot, na.rm = TRUE),
+    nug = first(nug)
+  ) %>%
+  mutate(ingreso_pc = ingreso_total / nug) %>%
+  select(id_hogar, ingreso_pc)
+
+# Renombrar no es necesario en R como en Python (ya tiene el nombre correcto)
+
+# Añadimos el ingreso total de la unidad de gasto al conjunto de datos principal
+# Usamos un merge:
+# Crear per_hogar2
+per_hogar2 <- per_hogar %>%
+  left_join(ingreso_pc, by = "id_hogar")
+
+# Verificar
+per_hogar2 %>% 
+  select(id, id_hogar, ug, nug, ingtot, ingreso_pc) %>% 
+  head(10)
+
+# Una forma más directa de hacer esto:
+per_hogar <- per_hogar %>%
+  group_by(id_hogar) %>%
+  mutate(
+    ingreso_pc = if_else(
+      any(ug == 1),  # Si hay alguien en la UG
+      sum(ingtot[ug == 1], na.rm = TRUE) / first(nug[ug == 1]),
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+per_hogar %>% 
+  select(id, id_hogar, ug, nug, ingtot, ingreso_pc) %>% 
+  head(10)
+
+# Actualizar per_hogar2
+per_hogar2 <- per_hogar
+
+# ------------------------------------------------------------------------------
+# PASO 2: INGRESO PER CÁPITA VS. LÍNEAS DE POBREZA
+# ------------------------------------------------------------------------------
+
+# El siguiente paso consiste en identificar a las personas cuyo ingreso per cápita
+# (por unidad de gasto) está por debajo de las líneas de pobreza establecidas: 
+# la línea de pobreza monetaria (lp) y la línea de pobreza monetaria extrema (li).
+
+# Examinamos el comportamiento de las líneas de pobreza
+# Para cada mes y cada dominio
+per_hogar2 %>%
+  group_by(mes, dominio) %>%
+  summarise(
+    lp = first(lp),
+    li = first(li),
+    .groups = "drop"
+  )
+
+# Realizamos la clasificación:
+
+# Personas por debajo de li (pobreza monetaria extrema)
+# Creación variable booleana pme
+per_hogar2 <- per_hogar2 %>%
+  mutate(pme = if_else(is.na(ingreso_pc), 0, if_else(ingreso_pc < li, 1, 0)))
+
+# Personas por debajo de lp (pobreza monetaria)
+# Creación variable booleana pm
+per_hogar2 <- per_hogar2 %>%
+  mutate(pm = if_else(is.na(ingreso_pc), 0, if_else(ingreso_pc < lp, 1, 0)))
+
+# ------------------------------------------------------------------------------
+# PASO 3: CÁLCULO DE INCIDENCIA
+# ------------------------------------------------------------------------------
+
+# Finalmente, con la clasificación de las personas como pobres en términos de 
+# pobreza monetaria (pm) y pobreza monetaria extrema (pme), calculamos las tasas 
+# de incidencia para cada ciudad principal.
+#
+# En este paso, trabajamos con tasas simples, es decir, sin aplicar factores 
+# de expansión.
+
+# Filtramos el conjunto de datos para Cali
+cali <- per_hogar2 %>%
+  filter(dominio == "CALI")
+
+# Calculamos la tasa sin ponderar (mensual)
+# Función mean() con group_by()
+cali %>%
+  group_by(mes) %>%
+  summarise(
+    tasa_pme = mean(pme, na.rm = TRUE) * 100,
+    tasa_pm = mean(pm, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# Calculamos la tasa sin ponderar (anual)
+# Función mean() sin agrupar
+cali %>%
+  summarise(
+    tasa_pme = mean(pme, na.rm = TRUE) * 100,
+    tasa_pm = mean(pm, na.rm = TRUE) * 100
+  )
+
+# Ahora calculamos las tasas de incidencia considerando los factores de 
+# expansión (fex_c). Ponderamos según los factores de expansión
+cali <- cali %>%
+  mutate(
+    pme_fex = pme * fex_c,
+    pm_fex = pm * fex_c
+  )
+
+# Calcula la tasa pme general
+tasa_pme_general <- sum(cali$pme_fex, na.rm = TRUE) / 
+                    sum(cali$fex_c, na.rm = TRUE) * 100
+print(paste("Tasa PME general Cali:", round(tasa_pme_general, 2), "%"))
+
+# Calcular tasa pme por mes
+cali %>%
+  group_by(mes) %>%
+  summarise(
+    tasa_pme = sum(pme_fex, na.rm = TRUE) / sum(fex_c, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# Lo mismo se aplica a la pobreza monetaria (pm)
+tasa_pm_general <- sum(cali$pm_fex, na.rm = TRUE) / 
+                   sum(cali$fex_c, na.rm = TRUE) * 100
+print(paste("Tasa PM general Cali:", round(tasa_pm_general, 2), "%"))
+
+# Lo mismo se aplica a la pobreza monetaria (pm), diferenciada según mes
+cali %>%
+  group_by(mes) %>%
+  summarise(
+    tasa_pm = sum(pm_fex, na.rm = TRUE) / sum(fex_c, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# La siguiente es una forma más directa de hacerlo:
+tasas_ponderadas <- cali %>%
+  group_by(mes) %>%
+  summarise(
+    pm_fex = sum(pm_fex, na.rm = TRUE),
+    pme_fex = sum(pme_fex, na.rm = TRUE),
+    fex_c = sum(fex_c, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pm = pm_fex / fex_c * 100,
+    pme = pme_fex / fex_c * 100
+  )
+
+print(tasas_ponderadas)
+
+# ------------------------------------------------------------------------------
+# EJERCICIO
+# ------------------------------------------------------------------------------
+
+# Para calcular las tasas ponderadas en las demás ciudades, simplemente seguimos
+# el mismo procedimiento. La única diferencia es que ahora agrupamos simultáneamente
+# por mes y ciudad (dominio), en lugar de hacerlo solo por mes.
+
+# Cálculo de la incidencia para 2023
+# Objeto: incidencia_ciudades
+incidencia_ciudades <- per_hogar2 %>%
+  filter(dominio %in% c("CALI", "MEDELLIN", "BOGOTA")) %>%
+  group_by(dominio) %>%
+  summarise(
+    pm = sum(pm * fex_c, na.rm = TRUE) / sum(fex_c, na.rm = TRUE) * 100,
+    pme = sum(pme * fex_c, na.rm = TRUE) / sum(fex_c, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(incidencia_ciudades)
+
+# Cálculo de la incidencia diferenciada según mes y ciudad
+# Objeto: incidencia_ciudades_mes
+incidencia_ciudades_mes <- per_hogar2 %>%
+  filter(dominio %in% c("CALI", "MEDELLIN", "BOGOTA")) %>%
+  group_by(dominio, mes) %>%
+  summarise(
+    pm = sum(pm * fex_c, na.rm = TRUE) / sum(fex_c, na.rm = TRUE) * 100,
+    pme = sum(pme * fex_c, na.rm = TRUE) / sum(fex_c, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(incidencia_ciudades_mes)
+
+# ==============================================================================
+# 7. VISUALIZACIÓN DE DATOS CON GGPLOT2
+# ==============================================================================
+
+# Preparar datos para visualización
+df_filt <- per_hogar2 %>%
+  filter(ingreso_pc > 0, !is.na(ingreso_pc)) %>%
+  mutate(log_ingpc = log(ingreso_pc))
+
+# 7.1 Histograma del log del ingreso per cápita
+# ----------------------------------------------
+ggplot(df_filt, aes(x = log_ingpc)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.6) +
+  labs(
+    title = "Distribución del logaritmo del ingreso per cápita",
+    x = "Logaritmo del ingreso per cápita (log(COP))",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+# 7.2 Boxplot por ciudad (sin outliers - showfliers=False)
+# ---------------------------------------------------------
+df_filt %>%
+  filter(dominio %in% c("CALI", "BOGOTA", "MEDELLIN")) %>%
+  ggplot(aes(x = dominio, y = log_ingpc)) +
+  geom_boxplot(outlier.shape = NA, fill = "skyblue", alpha = 0.7) +
+  labs(
+    title = "Distribución del log(ingreso per cápita) por ciudad",
+    x = "Ciudad",
+    y = "Logaritmo natural del ingreso per cápita"
+  ) +
+  theme_minimal()
+
+# 7.3 Histogramas por ciudad (equivalente a hist con by)
+# -------------------------------------------------------
+df_filt %>%
+  filter(dominio %in% c("CALI", "BOGOTA", "MEDELLIN")) %>%
+  ggplot(aes(x = log_ingpc)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.5) +
+  facet_wrap(~dominio, ncol = 1, scales = "free_y") +
+  labs(
+    x = "Logaritmo natural del ingreso per cápita",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+# 7.4 Gráfico de barras - Tasas de incidencia (anual)
+# ----------------------------------------------------
+
+# Para visualizar las tasas de incidencia para 2023
+# Podemos utilizar un gráfico de barras directamente
+incidencia_ciudades %>%
+  pivot_longer(cols = c(pm, pme), names_to = "indicador", values_to = "tasa") %>%
+  ggplot(aes(x = dominio, y = tasa, fill = indicador)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(
+    aes(label = sprintf("%.2f", tasa)),
+    position = position_dodge(width = 0.8),
+    vjust = -0.5,
+    size = 3.5
+  ) +
+  scale_fill_manual(
+    values = c("pm" = "#1f77b4", "pme" = "#ff7f0e"),
+    labels = c("pm" = "PM", "pme" = "PME")
+  ) +
+  labs(
+    title = "Tasa de incidencia de pobreza monetaria por ciudad",
+    x = "Ciudad",
+    y = "Tasa de incidencia (%)",
+    fill = "Indicador"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# 7.5 Serie temporal - Evolución mensual
+# ---------------------------------------
+
+# Para visualizar la serie 2023 de PME, hagamos una gráfica de líneas
+incidencia_ciudades_mes %>%
+  pivot_longer(cols = c(pm, pme), names_to = "indicador", values_to = "tasa") %>%
+  ggplot(aes(x = mes, y = tasa, color = dominio, linetype = indicador)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2, aes(shape = dominio)) +
+  scale_x_continuous(breaks = 1:12) +
+  scale_color_manual(
+    values = c("BOGOTA" = "blue", "CALI" = "green", "MEDELLIN" = "red")
+  ) +
+  scale_linetype_manual(
+    values = c("pm" = "solid", "pme" = "dashed"),
+    labels = c("PM", "PME")
+  ) +
+  labs(
+    title = "Evolución mensual de PM y PME por ciudad",
+    x = "Mes",
+    y = "Tasa (%)",
+    color = "Ciudad",
+    linetype = "Indicador",
+    shape = "Ciudad"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
